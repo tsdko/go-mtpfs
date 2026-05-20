@@ -7,6 +7,7 @@ package fs
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -17,9 +18,18 @@ import (
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/hanwen/go-mtpfs/mtp"
+	"github.com/hanwen/usb"
 )
 
 const blockSize = 512
+
+type MTPOptions struct {
+	DeviceFilter string
+	MTPDebug     bool
+	DataDebug    bool
+	USBDebug     bool
+	Timeout      int
+}
 
 type DeviceFsOptions struct {
 	// Assume removable volumes are VFAT and munge filenames
@@ -33,6 +43,8 @@ type DeviceFsOptions struct {
 	Android bool
 
 	StorageFilter string
+
+	MTPOptions MTPOptions
 }
 
 type mtpStorage struct {
@@ -59,6 +71,7 @@ type deviceFS struct {
 	delBackingDir bool
 	root          *rootNode
 	dev           *mtp.Device
+	devID         string
 	devInfo       mtp.DeviceInfo
 	storages      []mtpStorage
 	mungeVfat     map[uint32]bool
@@ -66,14 +79,68 @@ type deviceFS struct {
 	options *DeviceFsOptions
 }
 
+func openMTPDevice(id string, options *MTPOptions) (dev *mtp.Device, oid string, err error) {
+	if id == "" {
+		dev, err = mtp.SelectDevice(options.DeviceFilter)
+		if err != nil {
+			return nil, "", fmt.Errorf("detect failed: %w", err)
+		}
+		oid, err = dev.ID()
+		if err != nil {
+			return nil, "", fmt.Errorf("get device id: %w", err)
+		}
+	} else {
+		devs, err := mtp.FindDevices(usb.NewContext())
+		if err != nil {
+			return nil, "", fmt.Errorf("detect failed: %w", err)
+		}
+		for _, d := range devs {
+			if err := d.Open(); err != nil {
+				continue
+			}
+			did, err := d.ID()
+			if err != nil {
+				fmt.Println("find devices: get id:", err)
+				d.Close()
+				d.Done()
+				continue
+			}
+			if did == id {
+				dev = d
+				oid = did
+			} else {
+				d.Close()
+				d.Done()
+			}
+		}
+		if dev == nil {
+			return nil, "", fmt.Errorf("device %s not found", id)
+		}
+	}
+	dev.MTPDebug = options.MTPDebug
+	dev.DataDebug = options.DataDebug
+	dev.USBDebug = options.USBDebug
+	dev.Timeout = options.Timeout
+	if err = dev.Configure(); err != nil {
+		return nil, "", fmt.Errorf("Configure failed: %w", err)
+	}
+
+	return dev, oid, nil
+}
+
 // DeviceFs is a simple filesystem interface to an MTP device. It must
 // be mounted as SingleThread to make sure it is threadsafe.  The file
-// system assumes the device does not touch the storage.  Arguments
-// are the opened MTP device and a directory for the backing store.
-func NewDeviceFSRoot(d *mtp.Device, options DeviceFsOptions) (*rootNode, error) {
+// system assumes the device does not touch the storage.
+func NewDeviceFSRoot(options DeviceFsOptions) (*rootNode, error) {
+	d, did, err := openMTPDevice("", &options.MTPOptions)
+	if err != nil {
+		return nil, err
+	}
+
 	fs := &deviceFS{
 		root:    &rootNode{},
 		dev:     d,
+		devID:   did,
 		options: &options,
 	}
 	fs.root.fs = fs
@@ -110,6 +177,18 @@ func (dfs *deviceFS) ensureStorages() error {
 	}
 
 	sids, err := SelectStorages(dfs.dev, dfs.options.StorageFilter)
+	if errors.Is(err, usb.ERROR_NO_DEVICE) {
+		// XXX unlocking causes a usb disconnect apparently
+		dfs.dev.Close()
+		// this is fragile; we assume no device information we got in NewDeviceFSRoot
+		// has changed (and also assume the fs has not been populated at all, which
+		// should hold here since we're retrying due to missing storages)
+		dfs.dev, dfs.devID, err = openMTPDevice(dfs.devID, &dfs.options.MTPOptions)
+		if err != nil {
+			return fmt.Errorf("reopen device: %w", err)
+		}
+		sids, err = SelectStorages(dfs.dev, dfs.options.StorageFilter)
+	}
 	if err != nil {
 		return err
 	}
@@ -168,6 +247,7 @@ func (n *rootNode) OnUnmount() {
 		os.RemoveAll(n.fs.options.Dir)
 		n.fs.delBackingDir = false
 	}
+	n.fs.dev.Close()
 }
 
 var _ = (fs.NodeReaddirer)((*rootNode)(nil))

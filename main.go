@@ -15,7 +15,6 @@ import (
 	fusefs "github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/hanwen/go-mtpfs/fs"
-	"github.com/hanwen/go-mtpfs/mtp"
 )
 
 func main() {
@@ -35,29 +34,25 @@ func main() {
 	}
 	mountpoint := flag.Arg(0)
 
-	dev, err := mtp.SelectDevice(*deviceFilter)
-	if err != nil {
-		log.Fatalf("detect failed: %v", err)
-	}
-	defer dev.Close()
 	debugs := map[string]bool{}
 	for _, s := range strings.Split(*debug, ",") {
 		debugs[s] = true
 	}
-	dev.MTPDebug = debugs["mtp"]
-	dev.DataDebug = debugs["data"]
-	dev.USBDebug = debugs["usb"]
-	dev.Timeout = *usbTimeout
-	if err = dev.Configure(); err != nil {
-		log.Fatalf("Configure failed: %v", err)
+	mtpOptions := fs.MTPOptions{
+		DeviceFilter: *deviceFilter,
+		MTPDebug:     debugs["mtp"],
+		DataDebug:    debugs["data"],
+		USBDebug:     debugs["usb"],
+		Timeout:      *usbTimeout,
 	}
 
 	opts := fs.DeviceFsOptions{
 		RemovableVFat: *vfat,
 		Android:       *android,
 		StorageFilter: *storageFilter,
+		MTPOptions:    mtpOptions,
 	}
-	root, err := fs.NewDeviceFSRoot(dev, opts)
+	root, err := fs.NewDeviceFSRoot(opts)
 	if err != nil {
 		log.Fatalf("NewDeviceFs failed: %v", err)
 	}
