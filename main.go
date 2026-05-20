@@ -52,16 +52,12 @@ func main() {
 		log.Fatalf("Configure failed: %v", err)
 	}
 
-	sids, err := fs.SelectStorages(dev, *storageFilter)
-	if err != nil {
-		log.Fatalf("selectStorages failed: %v", err)
-	}
-
 	opts := fs.DeviceFsOptions{
 		RemovableVFat: *vfat,
 		Android:       *android,
+		StorageFilter: *storageFilter,
 	}
-	root, err := fs.NewDeviceFSRoot(dev, sids, opts)
+	root, err := fs.NewDeviceFSRoot(dev, opts)
 	if err != nil {
 		log.Fatalf("NewDeviceFs failed: %v", err)
 	}

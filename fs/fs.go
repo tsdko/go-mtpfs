@@ -31,6 +31,25 @@ type DeviceFsOptions struct {
 
 	// Use android extensions if available.
 	Android bool
+
+	StorageFilter string
+}
+
+type mtpStorage struct {
+	id uint32
+	mtp.StorageInfo
+}
+
+func (s *mtpStorage) ino() uint64 {
+	return uint64(s.id) << 33
+}
+
+func (s *mtpStorage) objectInfo() mtp.ObjectInfo {
+	return mtp.ObjectInfo{
+		ParentObject: NOPARENT_ID,
+		StorageID:    s.id,
+		Filename:     s.StorageDescription,
+	}
 }
 
 // DeviceFS implements a fuse.NodeFileSystem that mounts multiple
@@ -41,7 +60,7 @@ type deviceFS struct {
 	root          *rootNode
 	dev           *mtp.Device
 	devInfo       mtp.DeviceInfo
-	storages      []uint32
+	storages      []mtpStorage
 	mungeVfat     map[uint32]bool
 
 	options *DeviceFsOptions
@@ -51,14 +70,13 @@ type deviceFS struct {
 // be mounted as SingleThread to make sure it is threadsafe.  The file
 // system assumes the device does not touch the storage.  Arguments
 // are the opened MTP device and a directory for the backing store.
-func NewDeviceFSRoot(d *mtp.Device, storages []uint32, options DeviceFsOptions) (*rootNode, error) {
+func NewDeviceFSRoot(d *mtp.Device, options DeviceFsOptions) (*rootNode, error) {
 	fs := &deviceFS{
 		root:    &rootNode{},
 		dev:     d,
 		options: &options,
 	}
 	fs.root.fs = fs
-	fs.storages = storages
 	if err := d.GetDeviceInfo(&fs.devInfo); err != nil {
 		return nil, err
 	}
@@ -72,16 +90,7 @@ func NewDeviceFSRoot(d *mtp.Device, storages []uint32, options DeviceFsOptions) 
 			return nil, err
 		}
 	}
-
 	fs.mungeVfat = make(map[uint32]bool)
-	for _, sid := range fs.storages {
-		var info mtp.StorageInfo
-		if err := fs.dev.GetStorageInfo(sid, &info); err != nil {
-			return nil, err
-		}
-		fs.mungeVfat[sid] = info.IsRemovable() && fs.options.RemovableVFat
-	}
-
 	return fs.Root(), nil
 }
 
@@ -93,32 +102,30 @@ func (fs *deviceFS) String() string {
 	return fmt.Sprintf("deviceFS(%s)", fs.devInfo.Model)
 }
 
-func (dfs *deviceFS) OnAdd(ctx context.Context) {
-	for _, sid := range dfs.storages {
+func (dfs *deviceFS) ensureStorages() error {
+	// some devices return no storage IDs until the user unlocks the device;
+	// try querying every time the root dir is accessed if we don't have any
+	if len(dfs.storages) > 0 {
+		return nil
+	}
+
+	sids, err := SelectStorages(dfs.dev, dfs.options.StorageFilter)
+	if err != nil {
+		return err
+	}
+	dfs.storages = make([]mtpStorage, 0, len(sids))
+	for _, sid := range sids {
 		var info mtp.StorageInfo
 		if err := dfs.dev.GetStorageInfo(sid, &info); err != nil {
-			log.Printf("GetStorageInfo %x: %v", sid, err)
-			continue
+			return err
 		}
-
-		obj := mtp.ObjectInfo{
-			ParentObject: NOPARENT_ID,
-			StorageID:    sid,
-			Filename:     info.StorageDescription,
-		}
-		folder := dfs.newFolder(obj, NOPARENT_ID)
-		name := info.StorageDescription
-		stable := fs.StableAttr{
-			Mode: syscall.S_IFDIR,
-			Ino:  uint64(sid) << 33,
-		}
-
-		dfs.root.Inode.AddChild(name,
-			dfs.root.Inode.NewPersistentInode(
-				ctx,
-				folder, stable),
-			false)
+		dfs.mungeVfat[sid] = info.IsRemovable() && dfs.options.RemovableVFat
+		dfs.storages = append(dfs.storages, mtpStorage{
+			id:          sid,
+			StorageInfo: info,
+		})
 	}
+	return nil
 }
 
 // TODO - this should be per storage and return just the free space in
@@ -153,12 +160,6 @@ type rootNode struct {
 	fs *deviceFS
 }
 
-var _ = (fs.NodeOnAdder)((*rootNode)(nil))
-
-func (r *rootNode) OnAdd(ctx context.Context) {
-	r.fs.OnAdd(ctx)
-}
-
 const NOPARENT_ID = 0xFFFFFFFF
 
 // XXX
@@ -167,6 +168,52 @@ func (n *rootNode) OnUnmount() {
 		os.RemoveAll(n.fs.options.Dir)
 		n.fs.delBackingDir = false
 	}
+}
+
+var _ = (fs.NodeReaddirer)((*rootNode)(nil))
+
+func (n *rootNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
+	if err := n.fs.ensureStorages(); err != nil {
+		log.Println("get storages:", err)
+		return nil, syscall.EIO
+	}
+
+	r := make([]fuse.DirEntry, 0, len(n.fs.storages))
+	for _, s := range n.fs.storages {
+		r = append(r, fuse.DirEntry{
+			Name: s.StorageDescription,
+			Mode: syscall.S_IFDIR,
+			Ino:  s.ino(),
+		})
+	}
+	return fs.NewListDirStream(r), 0
+}
+
+var _ = (fs.NodeLookuper)((*rootNode)(nil))
+
+func (n *rootNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	if err := n.fs.ensureStorages(); err != nil {
+		log.Println("get storages: %v", err)
+		return nil, syscall.EIO
+	}
+
+	var s *mtpStorage
+	for _, ss := range n.fs.storages {
+		if ss.StorageDescription == name {
+			s = &ss
+			break
+		}
+	}
+	if s == nil {
+		return nil, syscall.ENOENT
+	}
+
+	stable := fs.StableAttr{
+		Mode: syscall.S_IFDIR,
+		Ino:  s.ino(),
+	}
+	folder := n.fs.newFolder(s.objectInfo(), NOPARENT_ID)
+	return n.NewPersistentInode(ctx, folder, stable), 0
 }
 
 func (n *rootNode) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
